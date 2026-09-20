@@ -55,4 +55,46 @@ public class UserDashboardController {
         UserDashboardResponse.PaymentHistoryItem payment = userDashboardService.payDues(token, paymentRequest, ipAddress);
         return ResponseEntity.ok(ApiResponse.success("Payment recorded successfully in database", payment));
     }
+
+    @PostMapping("/payment/razorpay/create-order")
+    public ResponseEntity<ApiResponse<com.Rent_Management.dto.RazorpayOrderResponse>> createRazorpayOrder(
+            @RequestHeader(value = "Authorization", required = false) String token,
+            @RequestBody(required = false) com.Rent_Management.dto.RazorpayOrderCreateRequest orderRequest,
+            HttpServletRequest request
+    ) {
+        if (token == null || token.isBlank()) {
+            token = request.getHeader("Authorization");
+        }
+        Double amount = (orderRequest != null) ? orderRequest.getAmount() : null;
+        com.Rent_Management.dto.RazorpayOrderResponse order = userDashboardService.createRazorpayOrder(token, amount);
+        return ResponseEntity.ok(ApiResponse.success("Razorpay payment order initialized successfully", order));
+    }
+
+    @PostMapping("/payment/razorpay/verify")
+    public ResponseEntity<ApiResponse<UserDashboardResponse.PaymentHistoryItem>> verifyRazorpayPayment(
+            @RequestHeader(value = "Authorization", required = false) String token,
+            @Valid @RequestBody com.Rent_Management.dto.RazorpayPaymentVerifyRequest verifyRequest,
+            HttpServletRequest request
+    ) {
+        if (token == null || token.isBlank()) {
+            token = request.getHeader("Authorization");
+        }
+        String ipAddress = request.getRemoteAddr();
+        UserDashboardResponse.PaymentHistoryItem payment = userDashboardService.verifyAndProcessRazorpayPayment(token, verifyRequest, ipAddress);
+        return ResponseEntity.ok(ApiResponse.success("Razorpay payment verified & receipt dispatched successfully", payment));
+    }
+
+    @PostMapping("/payment/razorpay/failure")
+    public ResponseEntity<ApiResponse<Void>> reportRazorpayFailure(
+            @RequestHeader(value = "Authorization", required = false) String token,
+            @RequestBody com.Rent_Management.dto.RazorpayPaymentFailureRequest failureRequest,
+            HttpServletRequest request
+    ) {
+        if (token == null || token.isBlank()) {
+            token = request.getHeader("Authorization");
+        }
+        String ipAddress = request.getRemoteAddr();
+        userDashboardService.handleRazorpayPaymentFailure(token, failureRequest, ipAddress);
+        return ResponseEntity.ok(ApiResponse.success("Payment failure logged and email alert dispatched to resident", null));
+    }
 }

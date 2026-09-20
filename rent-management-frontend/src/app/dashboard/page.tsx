@@ -101,6 +101,16 @@ export default function DashboardPage() {
   const [isDocumentModalOpen, setIsDocumentModalOpen] = useState(false);
   const [isMaintenanceModalOpen, setIsMaintenanceModalOpen] = useState(false);
 
+  // Razorpay Gateway State
+  const [isProcessingRazorpay, setIsProcessingRazorpay] = useState(false);
+  const [isPaymentFailedModalOpen, setIsPaymentFailedModalOpen] = useState(false);
+  const [paymentFailureDetails, setPaymentFailureDetails] = useState<{
+    orderId?: string;
+    reason?: string;
+    amount?: number;
+    code?: string;
+  } | null>(null);
+
   // Payment form state
   const [payAmount, setPayAmount] = useState<number>(0);
   const [payMode, setPayMode] = useState<string>("UPI");
@@ -356,6 +366,218 @@ export default function DashboardPage() {
       showToast("Network error while submitting payment.");
     } finally {
       setIsSubmittingPayment(false);
+    }
+  };
+
+  const loadRazorpayScript = (): Promise<boolean> => {
+    return new Promise((resolve) => {
+      if (typeof window === "undefined") return resolve(false);
+      if ((window as any).Razorpay) return resolve(true);
+      const existing = document.getElementById("razorpay-checkout-script");
+      if (existing) return resolve(true);
+      const script = document.createElement("script");
+      script.id = "razorpay-checkout-script";
+      script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.async = true;
+      script.onload = () => resolve(true);
+      script.onerror = () => resolve(false);
+      document.body.appendChild(script);
+    });
+  };
+
+  const handlePaymentFailureReport = async (
+    orderId?: string,
+    code?: string,
+    reason?: string,
+    amount?: number
+  ) => {
+    const session = getUserSession();
+    const finalReason = reason || "Payment transaction declined or cancelled by the user.";
+    setPaymentFailureDetails({
+      orderId: orderId || "ORD-PENDING",
+      reason: finalReason,
+      amount: amount || payAmount,
+      code: code || "PAYMENT_FAILED",
+    });
+    setIsPayModalOpen(false);
+    setIsPaymentFailedModalOpen(true);
+
+    if (session?.token) {
+      try {
+        await fetch("http://localhost:8080/api/user/payment/razorpay/failure", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: JSON.stringify({
+            orderId: orderId || "UNKNOWN",
+            paymentId: "N/A",
+            errorCode: code || "TRANSACTION_FAILED",
+            errorDescription: finalReason,
+            amount: amount || payAmount,
+          }),
+        });
+      } catch (err) {
+        console.warn("Failed to notify server of payment failure:", err);
+      }
+    }
+  };
+
+  const verifyRazorpayPaymentOnBackend = async (
+    razorpayResponse: {
+      razorpay_order_id: string;
+      razorpay_payment_id: string;
+      razorpay_signature: string;
+    },
+    amount: number
+  ) => {
+    const session = getUserSession();
+    if (!session) {
+      clearUserSession();
+      router.replace("/login?expired=true");
+      return;
+    }
+
+    setIsProcessingRazorpay(true);
+    try {
+      const res = await fetch("http://localhost:8080/api/user/payment/razorpay/verify", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify({
+          razorpayOrderId: razorpayResponse.razorpay_order_id,
+          razorpayPaymentId: razorpayResponse.razorpay_payment_id,
+          razorpaySignature: razorpayResponse.razorpay_signature,
+          amount: amount,
+        }),
+      });
+
+      const resData = await res.json();
+      if (res.ok && resData.success && resData.data) {
+        showToast("Payment verified! Official rent receipt generated & emailed.");
+        setIsPayModalOpen(false);
+        setSelectedReceipt(resData.data);
+        setIsReceiptModalOpen(true);
+        await fetchDashboardData();
+      } else {
+        await handlePaymentFailureReport(
+          razorpayResponse.razorpay_order_id,
+          "SIGNATURE_VERIFY_FAILED",
+          resData.message || "Payment verification failed on server",
+          amount
+        );
+      }
+    } catch (err) {
+      console.error("Verification error:", err);
+      await handlePaymentFailureReport(
+        razorpayResponse.razorpay_order_id,
+        "NETWORK_ERROR",
+        "Network error while verifying payment with server",
+        amount
+      );
+    } finally {
+      setIsProcessingRazorpay(false);
+    }
+  };
+
+  const handleRazorpayCheckout = async (amountToPay?: number) => {
+    const session = getUserSession();
+    if (!session) {
+      clearUserSession();
+      router.replace("/login?expired=true");
+      return;
+    }
+
+    const finalAmount = amountToPay ?? payAmount ?? currentDues?.pendingAmount ?? 0;
+    if (finalAmount <= 0) {
+      showToast("Please specify a valid payment amount greater than zero.");
+      return;
+    }
+
+    setIsProcessingRazorpay(true);
+    try {
+      const orderRes = await fetch("http://localhost:8080/api/user/payment/razorpay/create-order", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify({ amount: finalAmount }),
+      });
+
+      if (!orderRes.ok) {
+        const errJson = await orderRes.json().catch(() => null);
+        throw new Error(errJson?.message || "Failed to initialize payment gateway order.");
+      }
+
+      const orderDataWrap = await orderRes.json();
+      const orderData = orderDataWrap.data;
+
+      const loaded = await loadRazorpayScript();
+      if (!loaded || !(window as any).Razorpay) {
+        throw new Error("Unable to load Razorpay checkout script. Please check your internet connection.");
+      }
+
+      const options = {
+        key: orderData.keyId,
+        amount: orderData.amountInPaise,
+        currency: orderData.currency || "INR",
+        name: orderData.businessName || "Singh Rent House Enterprise",
+        description: `Rent Settlement - Room ${orderData.roomUnit} (${orderData.billingMonth})`,
+        image: "https://cdn-icons-png.flaticon.com/512/619/619153.png",
+        order_id: orderData.orderId,
+        prefill: {
+          name: orderData.tenantName,
+          email: orderData.tenantEmail,
+          contact: orderData.tenantContact,
+        },
+        theme: {
+          color: "#4f46e5",
+          backdrop_color: "rgba(11, 19, 38, 0.85)",
+        },
+        modal: {
+          ondismiss: async () => {
+            setIsProcessingRazorpay(false);
+            await handlePaymentFailureReport(
+              orderData.orderId,
+              "MODAL_CLOSED",
+              "Payment window closed by user without completion.",
+              finalAmount
+            );
+          },
+        },
+        handler: async (response: any) => {
+          await verifyRazorpayPaymentOnBackend(response, finalAmount);
+        },
+      };
+
+      const rzpInstance = new (window as any).Razorpay(options);
+      rzpInstance.on("payment.failed", async (response: any) => {
+        setIsProcessingRazorpay(false);
+        const reason = response?.error?.description || response?.error?.reason || "Card/UPI transaction declined by issuing bank.";
+        await handlePaymentFailureReport(
+          orderData.orderId,
+          response?.error?.code || "PAYMENT_DECLINED",
+          reason,
+          finalAmount
+        );
+      });
+
+      rzpInstance.open();
+    } catch (err: any) {
+      console.error("Razorpay setup error:", err);
+      showToast(err.message || "Failed to launch Razorpay gateway.");
+      await handlePaymentFailureReport(
+        "ORD-" + Date.now(),
+        "CLIENT_INIT_ERROR",
+        err.message || "Could not launch payment gateway",
+        finalAmount
+      );
+    } finally {
+      setIsProcessingRazorpay(false);
     }
   };
 
@@ -1125,21 +1347,21 @@ export default function DashboardPage() {
                 </button>
               </div>
 
-              <form onSubmit={handleProcessPayment} className="space-y-4">
+              <div className="space-y-4">
                 <div className="p-3.5 rounded-lg bg-surface-container border border-outline-variant/20 space-y-1">
                   <div className="text-xs text-outline font-mono">Room / Unit Allocation</div>
                   <div className="font-semibold text-sm text-on-surface">
                     {room ? `Room ${room.roomId} (${room.propertyType})` : "Unassigned"}
                   </div>
                   <div className="text-xs text-outline font-mono mt-1">
-                    Month: {currentDues?.billingMonth || "Current Cycle"} • Pending: ₹
+                    Month: {currentDues?.billingMonth || "Current Cycle"} • Total Pending: ₹
                     {(currentDues?.pendingAmount ?? 0).toLocaleString("en-IN")}
                   </div>
                 </div>
 
                 <div>
                   <label className="block text-xs font-mono text-outline mb-1">
-                    Payment Amount (₹) <span className="text-primary">*</span>
+                    Settlement Amount (₹) <span className="text-primary">*</span>
                   </label>
                   <input
                     type="number"
@@ -1153,62 +1375,169 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div>
-                  <label className="block text-xs font-mono text-outline mb-1">
-                    Payment Mode <span className="text-primary">*</span>
-                  </label>
-                  <select
-                    value={payMode}
-                    onChange={(e) => setPayMode(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container-high border border-outline-variant/40 text-on-surface font-mono text-sm focus:outline-none focus:border-primary"
-                  >
-                    <option value="UPI">UPI AutoPay / QR</option>
-                    <option value="NET_BANKING">Net Banking (IMPS/NEFT)</option>
-                    <option value="CREDIT_CARD">Credit / Debit Card</option>
-                    <option value="CASH">Direct Cash to Management</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-outline mb-1">
-                    Transaction Reference / UTR (Optional)
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. UPI/420199401202"
-                    value={payTxnRef}
-                    onChange={(e) => setPayTxnRef(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container-high border border-outline-variant/40 text-on-surface font-mono text-sm focus:outline-none focus:border-primary"
-                  />
-                </div>
-
-                <div className="pt-3 border-t border-outline-variant/20 flex items-center justify-end gap-3">
+                {/* --- RAZORPAY PRIMARY PAYMENT SECTION --- */}
+                <div className="p-4 rounded-xl bg-gradient-to-br from-[#0c2340]/60 via-surface-container to-[#1a1c36]/60 border border-primary/40 shadow-[0_0_20px_rgba(79,70,229,0.15)] space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-6 h-6 rounded bg-[#0284c7]/20 border border-[#0284c7]/40 flex items-center justify-center text-[#38bdf8]">
+                        <span className="material-symbols-outlined text-[16px]">bolt</span>
+                      </div>
+                      <span className="text-xs font-semibold text-white tracking-wide">Razorpay Instant Gateway</span>
+                    </div>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-primary/20 text-primary border border-primary/30">
+                      SECURE 256-BIT
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-outline leading-relaxed">
+                    Supports UPI (GPay, PhonePe, Paytm, BHIM), all Debit/Credit Cards & Net Banking with automated digital receipt.
+                  </p>
                   <button
                     type="button"
-                    onClick={() => setIsPayModalOpen(false)}
-                    className="px-4 py-2 rounded-lg bg-surface-container hover:bg-surface-container-high text-outline hover:text-on-surface font-mono text-xs"
+                    disabled={isProcessingRazorpay || payAmount <= 0}
+                    onClick={() => handleRazorpayCheckout(payAmount)}
+                    className="w-full py-3 px-4 rounded-lg bg-gradient-to-r from-primary via-[#4338CA] to-[#0284c7] hover:brightness-110 text-white font-mono text-xs font-semibold flex items-center justify-center gap-2 shadow-lg shadow-primary/25 transition-all duration-200 active:scale-[0.98] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={isSubmittingPayment}
-                    className="px-5 py-2 rounded-lg bg-primary hover:bg-[#4338CA] text-white font-mono text-xs font-semibold flex items-center gap-2 transition-all shadow-md"
-                  >
-                    {isSubmittingPayment ? (
+                    {isProcessingRazorpay ? (
                       <>
-                        <div className="w-3.5 h-3.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
-                        <span>Recording in DB...</span>
+                        <div className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                        <span>Initializing Razorpay...</span>
                       </>
                     ) : (
                       <>
-                        <span className="material-symbols-outlined text-[16px]">check_circle</span>
-                        <span>Confirm Payment ₹{payAmount.toLocaleString("en-IN")}</span>
+                        <span className="material-symbols-outlined text-[18px]">lock</span>
+                        <span>Pay Online ₹{payAmount.toLocaleString("en-IN")} with Razorpay</span>
                       </>
                     )}
                   </button>
                 </div>
-              </form>
+
+                {/* --- MANUAL OFFLINE / CASH HANDOVER COLLAPSIBLE --- */}
+                <details className="group rounded-lg bg-surface-container/50 border border-outline-variant/20 p-3">
+                  <summary className="text-xs font-mono text-outline cursor-pointer flex items-center justify-between select-none">
+                    <span>Or Record Offline / Cash Handover</span>
+                    <span className="material-symbols-outlined text-[16px] group-open:rotate-180 transition-transform">
+                      expand_more
+                    </span>
+                  </summary>
+                  <form onSubmit={handleProcessPayment} className="mt-3 space-y-3 pt-2 border-t border-outline-variant/15">
+                    <div>
+                      <label className="block text-[11px] font-mono text-outline mb-1">
+                        Manual Payment Mode
+                      </label>
+                      <select
+                        value={payMode}
+                        onChange={(e) => setPayMode(e.target.value)}
+                        className="w-full px-3 py-2 rounded bg-surface-container-high border border-outline-variant/40 text-on-surface font-mono text-xs"
+                      >
+                        <option value="CASH">Direct Cash to Management</option>
+                        <option value="UPI">Manual UPI Direct UTR</option>
+                        <option value="NET_BANKING">Net Banking (IMPS/NEFT)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-mono text-outline mb-1">
+                        Transaction Reference / Note
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="e.g. CASH-HANDOVER or UTR/420199401"
+                        value={payTxnRef}
+                        onChange={(e) => setPayTxnRef(e.target.value)}
+                        className="w-full px-3 py-2 rounded bg-surface-container-high border border-outline-variant/40 text-on-surface font-mono text-xs"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isSubmittingPayment}
+                      className="w-full py-2 rounded bg-surface-container-high hover:bg-surface-container border border-outline-variant/40 text-on-surface font-mono text-xs font-medium transition-all"
+                    >
+                      {isSubmittingPayment ? "Recording in DB..." : "Submit Manual Record"}
+                    </button>
+                  </form>
+                </details>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* 1.1. PAYMENT FAILED POPUP MODAL */}
+      <AnimatePresence>
+        {isPaymentFailedModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.92, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.92, y: 15 }}
+              className="bg-surface-container-low border border-red-500/40 rounded-2xl max-w-md w-full p-6 shadow-[0_0_50px_rgba(239,68,68,0.35)] space-y-5"
+            >
+              <div className="flex items-center justify-between pb-3 border-b border-outline-variant/20">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-full bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-400">
+                    <span className="material-symbols-outlined text-[20px]">error</span>
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-lg text-on-surface">Payment Failed</h3>
+                    <p className="text-[11px] text-red-400 font-mono">Transaction Incomplete / Declined</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsPaymentFailedModalOpen(false)}
+                  className="p-1 rounded hover:bg-surface-container text-outline hover:text-on-surface"
+                >
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+
+              <div className="space-y-3 font-mono text-xs">
+                <div className="p-3.5 rounded-lg bg-surface-container border border-red-500/25 space-y-1.5">
+                  <div className="flex justify-between items-center text-on-surface">
+                    <span className="text-outline">Attempted Amount:</span>
+                    <span className="text-sm font-bold text-red-400">
+                      ₹{(paymentFailureDetails?.amount ?? payAmount).toLocaleString("en-IN")}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-on-surface">
+                    <span className="text-outline">Order Reference:</span>
+                    <span className="text-[11px] text-outline">{paymentFailureDetails?.orderId || "ORD-N/A"}</span>
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-lg bg-red-950/25 border border-red-500/20 text-red-200 text-[12px] leading-relaxed">
+                  <span className="font-bold block text-red-300 mb-0.5">Failure Reason:</span>
+                  {paymentFailureDetails?.reason || "The payment transaction was cancelled or declined by your bank."}
+                </div>
+
+                <div className="p-3 rounded-lg bg-surface-container border border-outline-variant/20 text-[11px] text-outline leading-relaxed flex items-start gap-2">
+                  <span className="material-symbols-outlined text-[16px] text-primary mt-0.5">mark_email_read</span>
+                  <span>
+                    A failure notification email has been dispatched to <strong className="text-on-surface">{user?.email}</strong>. If money was debited from your account, Razorpay will auto-refund within 2-5 banking days.
+                  </span>
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-outline-variant/20 flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsPaymentFailedModalOpen(false)}
+                  className="px-4 py-2 rounded-lg bg-surface-container hover:bg-surface-container-high text-outline hover:text-on-surface font-mono text-xs"
+                >
+                  Dismiss
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsPaymentFailedModalOpen(false);
+                    handleRazorpayCheckout(paymentFailureDetails?.amount || payAmount);
+                  }}
+                  className="px-5 py-2 rounded-lg bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-mono text-xs font-semibold flex items-center gap-2 shadow-lg shadow-red-900/30 transition-all cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[16px]">replay</span>
+                  <span>Retry Payment with Razorpay</span>
+                </button>
+              </div>
             </motion.div>
           </div>
         )}

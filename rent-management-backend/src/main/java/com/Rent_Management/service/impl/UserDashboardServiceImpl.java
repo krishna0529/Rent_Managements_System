@@ -1,8 +1,8 @@
 package com.Rent_Management.service.impl;
 
-import com.Rent_Management.dto.UserDashboardResponse;
-import com.Rent_Management.dto.UserPaymentRequest;
-import com.Rent_Management.dto.UserProfileResponse;
+import com.Rent_Management.dto.*;
+import com.Rent_Management.service.RazorpayService;
+import com.Rent_Management.service.EmailService;
 import com.Rent_Management.entity.ElectricityBill;
 import com.Rent_Management.entity.Payment;
 import com.Rent_Management.entity.Room;
@@ -40,6 +40,8 @@ public class UserDashboardServiceImpl implements UserDashboardService {
     private final PaymentRepository paymentRepository;
     private final JwtTokenProvider jwtTokenProvider;
     private final AuditLogService auditLogService;
+    private final RazorpayService razorpayService;
+    private final EmailService emailService;
 
     private User resolveUserFromToken(String token) {
         if (token == null || token.isBlank()) {
@@ -277,5 +279,195 @@ public class UserDashboardServiceImpl implements UserDashboardService {
                 .paymentDate(saved.getPaymentDate())
                 .createdAt(saved.getCreatedAt())
                 .build();
+    }
+
+    @Override
+    public RazorpayOrderResponse createRazorpayOrder(String token, Double amount) {
+        User user = resolveUserFromToken(token);
+        Room userRoom = roomRepository.findByAssignedUser(user).orElse(null);
+
+        List<Payment> payments = paymentRepository.findByUserOrderByCreatedAtDesc(user);
+        Payment pendingPayment = payments.stream()
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .findFirst()
+                .orElse(null);
+
+        Double orderAmount = amount;
+        if (orderAmount == null || orderAmount <= 0) {
+            if (pendingPayment != null && pendingPayment.getPendingAmount() != null && pendingPayment.getPendingAmount() > 0) {
+                orderAmount = pendingPayment.getPendingAmount();
+            } else {
+                orderAmount = 1000.0; // Minimal fallback amount
+            }
+        }
+
+        String receiptTag = "rcpt_u" + user.getId() + "_" + System.currentTimeMillis();
+        String orderId = razorpayService.createOrder(orderAmount, receiptTag);
+        long amountInPaise = Math.round(orderAmount * 100);
+
+        String roomUnit = (userRoom != null && userRoom.getRoomId() != null) ? userRoom.getRoomId() : "Residential Suite";
+        String billingMonth = pendingPayment != null ? pendingPayment.getBillingMonth() : "Current Month";
+
+        return RazorpayOrderResponse.builder()
+                .orderId(orderId)
+                .amountInPaise(amountInPaise)
+                .amount(orderAmount)
+                .currency(razorpayService.getCurrency())
+                .keyId(razorpayService.getKeyId())
+                .businessName(razorpayService.getCompanyName())
+                .tenantName(user.getFullName())
+                .tenantEmail(user.getEmail())
+                .tenantContact(user.getMobileNumber())
+                .roomUnit(roomUnit)
+                .billingMonth(billingMonth)
+                .build();
+    }
+
+    @Override
+    @Transactional
+    public UserDashboardResponse.PaymentHistoryItem verifyAndProcessRazorpayPayment(
+            String token,
+            RazorpayPaymentVerifyRequest request,
+            String ipAddress
+    ) {
+        User user = resolveUserFromToken(token);
+        Room userRoom = roomRepository.findByAssignedUser(user).orElse(null);
+
+        boolean isValid = razorpayService.verifySignature(
+                request.getRazorpayOrderId(),
+                request.getRazorpayPaymentId(),
+                request.getRazorpaySignature()
+        );
+
+        if (!isValid) {
+            log.error("[RAZORPAY REJECTED] Signature mismatch for tenant '{}' on order '{}'", user.getUsername(), request.getRazorpayOrderId());
+            throw new BadRequestException("Razorpay signature verification failed. Possible fraud or transaction tampering detected.");
+        }
+
+        List<Payment> payments = paymentRepository.findByUserOrderByCreatedAtDesc(user);
+        Payment pendingPayment = payments.stream()
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .findFirst()
+                .orElse(null);
+
+        if (pendingPayment == null) {
+            // If no existing pending bill, create a new settled payment record
+            pendingPayment = Payment.builder()
+                    .user(user)
+                    .room(userRoom)
+                    .billingMonth(LocalDate.now().getMonth().name() + " " + LocalDate.now().getYear())
+                    .rentAmount(request.getAmount())
+                    .electricityAmount(0.0)
+                    .totalAmount(request.getAmount())
+                    .amountPaid(0.0)
+                    .pendingAmount(request.getAmount())
+                    .paymentStatus("PENDING")
+                    .createdAt(LocalDateTime.now())
+                    .build();
+        }
+
+        Double payAmount = request.getAmount();
+        pendingPayment.setAmountPaid(pendingPayment.getAmountPaid() + payAmount);
+        pendingPayment.setPaymentMode("RAZORPAY");
+        pendingPayment.setTransactionReference(request.getRazorpayPaymentId());
+        pendingPayment.setPaymentDate(LocalDateTime.now());
+
+        pendingPayment.setPendingAmount(Math.max(0.0, pendingPayment.getTotalAmount() - pendingPayment.getAmountPaid()));
+        if (pendingPayment.getPendingAmount() <= 0.0) {
+            pendingPayment.setPaymentStatus("PAID");
+            if (pendingPayment.getElectricityBill() != null) {
+                ElectricityBill bill = pendingPayment.getElectricityBill();
+                bill.setStatus("PAID");
+                electricityBillRepository.save(bill);
+            }
+            // Advance nextDueDate by 30 days in database upon rent payment settlement
+            LocalDate currentDue = user.getNextDueDate() != null
+                    ? user.getNextDueDate()
+                    : (user.getDateOfJoining() != null ? user.getDateOfJoining().plusDays(30) : LocalDate.now().plusDays(30));
+            user.setNextDueDate(currentDue.plusDays(30));
+            userRepository.save(user);
+        } else {
+            pendingPayment.setPaymentStatus("PARTIAL");
+        }
+
+        Payment saved = paymentRepository.save(pendingPayment);
+        String invoiceNumber = String.format("INV-%d-%04d", saved.getCreatedAt() != null ? saved.getCreatedAt().getYear() : 2026, saved.getId());
+
+        // Send Dark Luxury Payment Receipt Email to tenant
+        try {
+            emailService.sendPaymentSuccessReceiptEmail(
+                    user.getEmail(),
+                    user.getFullName(),
+                    userRoom != null ? userRoom.getRoomId() : "Suite",
+                    saved.getRentAmount(),
+                    saved.getElectricityAmount(),
+                    payAmount,
+                    saved.getTransactionReference(),
+                    invoiceNumber,
+                    user.getNextDueDate(),
+                    saved.getPaymentDate()
+            );
+        } catch (Exception e) {
+            log.error("[RECEIPT EMAIL EXCEPTION] Failed to send email receipt: {}", e.getMessage());
+        }
+
+        // Audit Trail
+        auditLogService.log(
+                "TENANT_RAZORPAY_PAYMENT",
+                user.getUsername(),
+                "Payment",
+                saved.getId().toString(),
+                "Razorpay Online Payment of ₹" + payAmount + " settled (Order: " + request.getRazorpayOrderId() + ", Payment: " + request.getRazorpayPaymentId() + ")",
+                ipAddress != null ? ipAddress : "127.0.0.1"
+        );
+
+        return UserDashboardResponse.PaymentHistoryItem.builder()
+                .id(saved.getId())
+                .invoiceNumber(invoiceNumber)
+                .billingMonth(saved.getBillingMonth())
+                .rentAmount(saved.getRentAmount())
+                .electricityAmount(saved.getElectricityAmount())
+                .totalAmount(saved.getTotalAmount())
+                .amountPaid(saved.getAmountPaid())
+                .status(saved.getPaymentStatus())
+                .paymentMode(saved.getPaymentMode())
+                .transactionReference(saved.getTransactionReference())
+                .paymentDate(saved.getPaymentDate())
+                .createdAt(saved.getCreatedAt())
+                .build();
+    }
+
+    @Override
+    public void handleRazorpayPaymentFailure(
+            String token,
+            RazorpayPaymentFailureRequest request,
+            String ipAddress
+    ) {
+        User user = resolveUserFromToken(token);
+        Room userRoom = roomRepository.findByAssignedUser(user).orElse(null);
+
+        // Send Payment Failure Alert Email to tenant
+        try {
+            emailService.sendPaymentFailureNotificationEmail(
+                    user.getEmail(),
+                    user.getFullName(),
+                    userRoom != null ? userRoom.getRoomId() : "Suite",
+                    request.getAmount(),
+                    request.getOrderId(),
+                    request.getErrorDescription() != null ? request.getErrorDescription() : "Bank transaction declined or cancelled"
+            );
+        } catch (Exception e) {
+            log.error("[FAILURE EMAIL EXCEPTION] Could not dispatch payment failure alert email: {}", e.getMessage());
+        }
+
+        // Audit Log
+        auditLogService.log(
+                "TENANT_RAZORPAY_FAILED",
+                user.getUsername(),
+                "Payment",
+                request.getOrderId() != null ? request.getOrderId() : "N/A",
+                "Razorpay payment attempt of ₹" + request.getAmount() + " failed: " + request.getErrorDescription(),
+                ipAddress != null ? ipAddress : "127.0.0.1"
+        );
     }
 }
