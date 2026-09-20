@@ -49,6 +49,16 @@ public class AdminPaymentController {
         return ResponseEntity.ok(ApiResponse.success("Payment marked as settled and cleared in database", paid));
     }
 
+    @PutMapping("/{id}/status")
+    public ResponseEntity<ApiResponse<PaymentResponse>> updatePaymentStatus(
+            @PathVariable Long id,
+            @RequestHeader(value = "Authorization", required = false) String authHeader,
+            @RequestBody @Valid com.Rent_Management.dto.PaymentStatusUpdateRequest request
+    ) {
+        PaymentResponse updated = adminPaymentService.updatePaymentStatus(id, request, "Harpreet Singh (Admin)");
+        return ResponseEntity.ok(ApiResponse.success("Payment status updated to " + request.getStatus() + " successfully", updated));
+    }
+
     @DeleteMapping("/{id}")
     public ResponseEntity<ApiResponse<Void>> deletePayment(
             @PathVariable Long id,

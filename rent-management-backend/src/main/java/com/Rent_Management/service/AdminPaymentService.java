@@ -15,5 +15,7 @@ public interface AdminPaymentService {
 
     PaymentResponse markPaymentAsPaid(Long id, PaymentRecordRequest request, String performedBy);
 
+    PaymentResponse updatePaymentStatus(Long id, com.Rent_Management.dto.PaymentStatusUpdateRequest request, String performedBy);
+
     void deletePayment(Long id, String performedBy);
 }

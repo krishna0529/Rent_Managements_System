@@ -163,7 +163,7 @@ public class UserDashboardServiceImpl implements UserDashboardService {
                 .collect(Collectors.toList());
 
         Payment pendingPayment = payments.stream()
-                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()) || "FAILED".equalsIgnoreCase(p.getPaymentStatus()))
                 .findFirst()
                 .orElse(null);
 
@@ -215,7 +215,7 @@ public class UserDashboardServiceImpl implements UserDashboardService {
 
         List<Payment> payments = paymentRepository.findByUserOrderByCreatedAtDesc(user);
         Payment pendingPayment = payments.stream()
-                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()) || "FAILED".equalsIgnoreCase(p.getPaymentStatus()))
                 .findFirst()
                 .orElse(null);
 
@@ -288,7 +288,7 @@ public class UserDashboardServiceImpl implements UserDashboardService {
 
         List<Payment> payments = paymentRepository.findByUserOrderByCreatedAtDesc(user);
         Payment pendingPayment = payments.stream()
-                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()) || "FAILED".equalsIgnoreCase(p.getPaymentStatus()))
                 .findFirst()
                 .orElse(null);
 
@@ -346,7 +346,7 @@ public class UserDashboardServiceImpl implements UserDashboardService {
 
         List<Payment> payments = paymentRepository.findByUserOrderByCreatedAtDesc(user);
         Payment pendingPayment = payments.stream()
-                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()))
+                .filter(p -> "PENDING".equalsIgnoreCase(p.getPaymentStatus()) || "PARTIAL".equalsIgnoreCase(p.getPaymentStatus()) || "FAILED".equalsIgnoreCase(p.getPaymentStatus()))
                 .findFirst()
                 .orElse(null);
 

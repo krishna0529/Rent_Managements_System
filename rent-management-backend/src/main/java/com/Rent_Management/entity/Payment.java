@@ -82,6 +82,10 @@ public class Payment {
         this.totalAmount = this.rentAmount + this.electricityAmount;
         if (this.amountPaid == null) this.amountPaid = 0.0;
         this.pendingAmount = Math.max(0.0, this.totalAmount - this.amountPaid);
+        if ("FAILED".equalsIgnoreCase(this.paymentStatus)) {
+            // Retain explicit FAILED status
+            return;
+        }
         if (this.pendingAmount <= 0.0 && this.amountPaid > 0.0) {
             this.paymentStatus = "PAID";
         } else if (this.amountPaid > 0.0) {

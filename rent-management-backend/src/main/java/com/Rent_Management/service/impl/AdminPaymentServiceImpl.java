@@ -157,6 +157,110 @@ public class AdminPaymentServiceImpl implements AdminPaymentService {
 
     @Override
     @Transactional
+    public PaymentResponse updatePaymentStatus(Long id, com.Rent_Management.dto.PaymentStatusUpdateRequest request, String performedBy) {
+        Payment payment = paymentRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Payment record not found with ID: " + id));
+
+        if (request.getStatus() == null || request.getStatus().isBlank()) {
+            throw new BadRequestException("Status is required (PENDING, FAILED, PAID)");
+        }
+
+        String targetStatus = request.getStatus().trim().toUpperCase();
+        String oldStatus = payment.getPaymentStatus();
+
+        if (!targetStatus.equals("PENDING") && !targetStatus.equals("FAILED") && !targetStatus.equals("PAID")) {
+            throw new BadRequestException("Invalid status: " + targetStatus + ". Allowed values are PENDING, FAILED, PAID.");
+        }
+
+        if (targetStatus.equals("PENDING")) {
+            if ("PAID".equalsIgnoreCase(oldStatus) && payment.getUser() != null) {
+                User u = payment.getUser();
+                if (u.getNextDueDate() != null) {
+                    java.time.LocalDate rolledBack = u.getNextDueDate().minusDays(30);
+                    if (u.getDateOfJoining() != null && rolledBack.isBefore(u.getDateOfJoining().plusDays(30))) {
+                        rolledBack = u.getDateOfJoining().plusDays(30);
+                    }
+                    u.setNextDueDate(rolledBack);
+                    userRepository.save(u);
+                }
+            }
+
+            if (payment.getElectricityBill() != null) {
+                ElectricityBill bill = payment.getElectricityBill();
+                bill.setStatus("PENDING");
+                electricityBillRepository.save(bill);
+            }
+
+            payment.setAmountPaid(0.0);
+            payment.setPendingAmount(payment.getTotalAmount());
+            payment.setPaymentStatus("PENDING");
+            payment.setPaymentDate(null);
+
+        } else if (targetStatus.equals("FAILED")) {
+            if ("PAID".equalsIgnoreCase(oldStatus) && payment.getUser() != null) {
+                User u = payment.getUser();
+                if (u.getNextDueDate() != null) {
+                    java.time.LocalDate rolledBack = u.getNextDueDate().minusDays(30);
+                    if (u.getDateOfJoining() != null && rolledBack.isBefore(u.getDateOfJoining().plusDays(30))) {
+                        rolledBack = u.getDateOfJoining().plusDays(30);
+                    }
+                    u.setNextDueDate(rolledBack);
+                    userRepository.save(u);
+                }
+            }
+
+            if (payment.getElectricityBill() != null) {
+                ElectricityBill bill = payment.getElectricityBill();
+                bill.setStatus("PENDING");
+                electricityBillRepository.save(bill);
+            }
+
+            payment.setAmountPaid(0.0);
+            payment.setPendingAmount(payment.getTotalAmount());
+            payment.setPaymentStatus("FAILED");
+
+        } else if (targetStatus.equals("PAID")) {
+            payment.setAmountPaid(payment.getTotalAmount());
+            payment.setPendingAmount(0.0);
+            payment.setPaymentStatus("PAID");
+            payment.setPaymentDate(LocalDateTime.now());
+            if (payment.getPaymentMode() == null) {
+                payment.setPaymentMode("ADMIN_OVERRIDE");
+            }
+
+            if (payment.getElectricityBill() != null) {
+                ElectricityBill bill = payment.getElectricityBill();
+                bill.setStatus("PAID");
+                electricityBillRepository.save(bill);
+            }
+
+            if (!"PAID".equalsIgnoreCase(oldStatus) && payment.getUser() != null && !"Security Deposit".equalsIgnoreCase(payment.getBillingMonth())) {
+                User u = payment.getUser();
+                java.time.LocalDate currentDue = u.getNextDueDate() != null
+                        ? u.getNextDueDate()
+                        : (u.getDateOfJoining() != null ? u.getDateOfJoining().plusDays(30) : java.time.LocalDate.now().plusDays(30));
+                u.setNextDueDate(currentDue.plusDays(30));
+                userRepository.save(u);
+            }
+        }
+
+        Payment saved = paymentRepository.save(payment);
+
+        String tenantName = saved.getUser() != null ? saved.getUser().getFullName() : "N/A";
+        auditLogService.log(
+                "ADMIN_PAYMENT_STATUS_CHANGE",
+                performedBy,
+                "Payment",
+                String.valueOf(saved.getId()),
+                "Payment #" + saved.getId() + " status modified from " + oldStatus + " to " + targetStatus + " by admin for tenant " + tenantName + (request.getReason() != null ? " (Reason: " + request.getReason() + ")" : ""),
+                null
+        );
+
+        return mapToResponse(saved);
+    }
+
+    @Override
+    @Transactional
     public void deletePayment(Long id, String performedBy) {
         Payment payment = paymentRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Payment record not found with ID: " + id));

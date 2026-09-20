@@ -17,7 +17,7 @@ export interface PaymentItem {
   totalAmount: number; // rent + electricity
   amountPaid: number;
   pendingAmount: number;
-  paymentStatus: "PENDING" | "PAID" | "PARTIAL";
+  paymentStatus: "PENDING" | "PAID" | "PARTIAL" | "FAILED";
   paymentMode: string | null;
   transactionReference: string | null;
   paymentDate: string | null;
@@ -31,7 +31,7 @@ interface PaymentLedgerViewProps {
 export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps) {
   const [payments, setPayments] = useState<PaymentItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"PENDING" | "ALL" | "PAID">("PENDING");
+  const [activeTab, setActiveTab] = useState<"PENDING" | "ALL" | "PAID" | "FAILED">("PENDING");
   const [searchQuery, setSearchQuery] = useState("");
 
   // Modals state
@@ -39,6 +39,12 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
   const [previewReceipt, setPreviewReceipt] = useState<PaymentItem | null>(null);
   const [deletePaymentId, setDeletePaymentId] = useState<number | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Status Change Modal State
+  const [statusPayment, setStatusPayment] = useState<PaymentItem | null>(null);
+  const [targetStatus, setTargetStatus] = useState<"PENDING" | "FAILED" | "PAID">("PENDING");
+  const [statusReason, setStatusReason] = useState<string>("");
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
 
   // Settle form
   const [settleAmount, setSettleAmount] = useState<string>("");
@@ -69,6 +75,55 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
     setSettleAmount(String(p.pendingAmount > 0 ? p.pendingAmount : p.totalAmount));
     setSettleMode("UPI");
     setSettleTxnRef(`UPI-${Date.now().toString().slice(-6)}`);
+  };
+
+  const openStatusModal = (p: PaymentItem, defaultStatus?: "PENDING" | "FAILED" | "PAID") => {
+    setStatusPayment(p);
+    setTargetStatus(defaultStatus || (p.paymentStatus === "PAID" ? "PENDING" : "PAID"));
+    setStatusReason("");
+  };
+
+  const handleUpdateStatus = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!statusPayment) return;
+
+    setIsUpdatingStatus(true);
+    const session = getAdminSession();
+    try {
+      const res = await fetch(
+        `http://localhost:8080/api/admin/payments/${statusPayment.id}/status`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: session ? `Bearer ${session.token}` : "",
+          },
+          body: JSON.stringify({
+            status: targetStatus,
+            reason: statusReason.trim() || `Admin set status to ${targetStatus}`,
+          }),
+        }
+      );
+
+      if (res.ok) {
+        showToast(
+          `Payment #PAY-${statusPayment.id} set to ${targetStatus}! ${
+            targetStatus === "PENDING" || targetStatus === "FAILED"
+              ? `₹${statusPayment.totalAmount.toLocaleString("en-IN")} pending dues restored for ${statusPayment.userName} to repay.`
+              : "Payment marked as settled in full."
+          }`
+        );
+        setStatusPayment(null);
+        fetchPayments();
+      } else {
+        const errJson = await res.json();
+        showToast(errJson?.message || "Failed to update payment status");
+      }
+    } catch {
+      showToast("Network error updating payment status");
+    } finally {
+      setIsUpdatingStatus(false);
+    }
   };
 
   const handleConfirmSettle = async (e: React.FormEvent) => {
@@ -138,7 +193,8 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
     }
   };
 
-  const pendingPayments = payments.filter((p) => p.paymentStatus !== "PAID");
+  const pendingPayments = payments.filter((p) => p.paymentStatus === "PENDING" || p.paymentStatus === "PARTIAL");
+  const failedPayments = payments.filter((p) => p.paymentStatus === "FAILED");
   const paidPayments = payments.filter((p) => p.paymentStatus === "PAID");
 
   const displayedPayments = payments.filter((p) => {
@@ -147,12 +203,13 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
       p.roomCode.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.billingMonth.toLowerCase().includes(searchQuery.toLowerCase());
 
-    if (activeTab === "PENDING") return matchesSearch && p.paymentStatus !== "PAID";
+    if (activeTab === "PENDING") return matchesSearch && (p.paymentStatus === "PENDING" || p.paymentStatus === "PARTIAL");
+    if (activeTab === "FAILED") return matchesSearch && p.paymentStatus === "FAILED";
     if (activeTab === "PAID") return matchesSearch && p.paymentStatus === "PAID";
     return matchesSearch;
   });
 
-  const totalPendingSum = pendingPayments.reduce((acc, p) => acc + (p.pendingAmount || 0), 0);
+  const totalPendingSum = payments.reduce((acc, p) => (p.paymentStatus !== "PAID" ? acc + (p.pendingAmount || 0) : acc), 0);
   const totalSettledSum = paidPayments.reduce((acc, p) => acc + (p.amountPaid || 0), 0);
 
   return (
@@ -270,12 +327,12 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
             onClick={() => setActiveTab("PENDING")}
             className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
               activeTab === "PENDING"
-                ? "bg-error/20 text-error border border-error/40 font-bold shadow-sm"
+                ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold shadow-sm"
                 : "bg-surface-container hover:bg-surface-container-high text-on-surface-variant"
             }`}
           >
-            <span className="w-2 h-2 rounded-full bg-error" />
-            3.6.1 Pending Payments ({pendingPayments.length})
+            <span className="w-2 h-2 rounded-full bg-amber-400" />
+            3.6.1 Pending Dues ({pendingPayments.length})
           </button>
 
           <button
@@ -301,6 +358,19 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
           >
             <span className="w-2 h-2 rounded-full bg-tertiary" />
             Settled / Paid ({paidPayments.length})
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("FAILED")}
+            className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+              activeTab === "FAILED"
+                ? "bg-error/20 text-error border border-error/40 font-bold"
+                : "bg-surface-container hover:bg-surface-container-high text-on-surface-variant"
+            }`}
+          >
+            <span className="material-symbols-outlined text-[14px] text-error">cancel</span>
+            Failed ({failedPayments.length})
           </button>
         </div>
 
@@ -414,20 +484,30 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
                     {/* Payment Status & Pending Amount / Paid Details */}
                     <td className="py-3 px-4">
                       <div className="space-y-1">
-                        <span
-                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                            p.paymentStatus === "PAID"
-                              ? "bg-tertiary/15 text-tertiary border border-tertiary/30"
-                              : "bg-error/15 text-error border border-error/30"
-                          }`}
-                        >
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              p.paymentStatus === "PAID" ? "bg-tertiary" : "bg-error animate-pulse"
-                            }`}
-                          />
-                          {p.paymentStatus}
-                        </span>
+                        {p.paymentStatus === "PAID" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-tertiary/15 text-tertiary border border-tertiary/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-tertiary" />
+                            PAID
+                          </span>
+                        )}
+                        {p.paymentStatus === "PENDING" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                            PENDING
+                          </span>
+                        )}
+                        {p.paymentStatus === "FAILED" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-error/20 text-error border border-error/40">
+                            <span className="material-symbols-outlined text-[13px]">cancel</span>
+                            FAILED
+                          </span>
+                        )}
+                        {p.paymentStatus === "PARTIAL" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-secondary/15 text-secondary border border-secondary/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-secondary" />
+                            PARTIAL
+                          </span>
+                        )}
 
                         {p.paymentStatus === "PAID" ? (
                           <div className="text-[11px] font-semibold text-tertiary">
@@ -455,8 +535,12 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
                               ) : null}
                             </div>
                           </div>
-                        ) : (
+                        ) : p.paymentStatus === "FAILED" ? (
                           <div className="text-error text-[11px] font-bold">
+                            Failed • Due: ₹{p.pendingAmount.toLocaleString("en-IN")}
+                          </div>
+                        ) : (
+                          <div className="text-amber-400 text-[11px] font-bold">
                             Due: ₹{p.pendingAmount.toLocaleString("en-IN")}
                           </div>
                         )}
@@ -465,17 +549,99 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
 
                     {/* Actions */}
                     <td className="py-3 px-4 text-right">
-                      <div className="flex items-center justify-end gap-1.5">
-                        {p.paymentStatus !== "PAID" && (
+                      <div className="flex items-center justify-end gap-1.5 flex-wrap sm:flex-nowrap">
+                        {/* If PAID: Allow Admin to Revert to Pending or Mark Failed */}
+                        {p.paymentStatus === "PAID" && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openStatusModal(p, "PENDING")}
+                              className="px-2 py-1 rounded-md bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-[10px] font-bold transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                              title="Revert payment to PENDING dues so tenant can pay again"
+                            >
+                              <span className="material-symbols-outlined text-[13px]">history</span>
+                              Revert Pending
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openStatusModal(p, "FAILED")}
+                              className="px-2 py-1 rounded-md bg-error/15 hover:bg-error/25 text-error border border-error/40 text-[10px] font-bold transition-all cursor-pointer flex items-center gap-1"
+                              title="Mark transaction as Failed"
+                            >
+                              <span className="material-symbols-outlined text-[13px]">cancel</span>
+                              Mark Failed
+                            </button>
+                          </>
+                        )}
+
+                        {/* If PENDING: Allow Admin to Mark Paid or Mark Failed */}
+                        {p.paymentStatus === "PENDING" && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openSettleModal(p)}
+                              className="px-2.5 py-1 rounded-lg bg-primary-container hover:bg-indigo-600 text-white font-bold text-[11px] transition-all cursor-pointer shadow-sm"
+                              title="Settle Payment"
+                            >
+                              Mark Paid
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openStatusModal(p, "FAILED")}
+                              className="px-2 py-1 rounded-md bg-error/15 hover:bg-error/25 text-error border border-error/40 text-[10px] font-bold transition-all cursor-pointer flex items-center gap-1"
+                              title="Mark transaction as Failed"
+                            >
+                              <span className="material-symbols-outlined text-[13px]">cancel</span>
+                              Mark Failed
+                            </button>
+                          </>
+                        )}
+
+                        {/* If FAILED: Allow Admin to Set to Pending or Mark Paid */}
+                        {p.paymentStatus === "FAILED" && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openStatusModal(p, "PENDING")}
+                              className="px-2 py-1 rounded-md bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-[10px] font-bold transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                              title="Set status to Pending"
+                            >
+                              <span className="material-symbols-outlined text-[13px]">pending_actions</span>
+                              Set Pending
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openSettleModal(p)}
+                              className="px-2.5 py-1 rounded-lg bg-primary-container hover:bg-indigo-600 text-white font-bold text-[11px] transition-all cursor-pointer shadow-sm"
+                              title="Settle Payment"
+                            >
+                              Mark Paid
+                            </button>
+                          </>
+                        )}
+
+                        {/* If PARTIAL */}
+                        {p.paymentStatus === "PARTIAL" && (
                           <button
                             type="button"
                             onClick={() => openSettleModal(p)}
                             className="px-2.5 py-1 rounded-lg bg-primary-container hover:bg-indigo-600 text-white font-bold text-[11px] transition-all cursor-pointer shadow-sm"
-                            title="Settle Payment"
+                            title="Settle Remaining"
                           >
-                            Mark Paid
+                            Clear Dues
                           </button>
                         )}
+
+                        {/* Status Change Selector Modal Button */}
+                        <button
+                          type="button"
+                          onClick={() => openStatusModal(p)}
+                          className="p-1 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-amber-300 transition-colors cursor-pointer"
+                          title="Change Payment Status (Pending / Failed / Paid)"
+                        >
+                          <span className="material-symbols-outlined text-[18px]">published_with_changes</span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => setPreviewReceipt(p)}
@@ -713,6 +879,199 @@ export default function PaymentLedgerView({ showToast }: PaymentLedgerViewProps)
                   className="px-4 py-1.5 rounded-lg bg-primary-container text-white cursor-pointer"
                 >
                   Close Receipt
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* PAYMENT STATUS CHANGE MODAL */}
+      <AnimatePresence>
+        {statusPayment && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-surface-container-low border border-outline-variant/40 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 font-mono text-xs"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between pb-3 border-b border-outline-variant/30">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400">
+                    <span className="material-symbols-outlined text-[20px]">published_with_changes</span>
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-on-surface text-base">Update Payment Status</h3>
+                    <p className="text-[11px] text-outline">Manage dues &amp; enable tenant repayment</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setStatusPayment(null)}
+                  className="p-1.5 rounded-lg hover:bg-surface-container text-outline hover:text-on-surface cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[20px]">close</span>
+                </button>
+              </div>
+
+              {/* Payment Summary Box */}
+              <div className="p-3.5 rounded-xl bg-surface-container/70 border border-outline-variant/25 space-y-1.5">
+                <div className="flex justify-between items-center">
+                  <span className="text-outline">Tenant &amp; Unit:</span>
+                  <span className="text-on-surface font-bold">
+                    {statusPayment.userName} <span className="text-secondary font-mono">({statusPayment.roomCode})</span>
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-outline">Invoice Month / Type:</span>
+                  <span className="text-on-surface font-medium">{statusPayment.billingMonth}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-outline">Current Status:</span>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                      statusPayment.paymentStatus === "PAID"
+                        ? "bg-tertiary/20 text-tertiary border border-tertiary/40"
+                        : statusPayment.paymentStatus === "FAILED"
+                        ? "bg-error/20 text-error border border-error/40"
+                        : "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                    }`}
+                  >
+                    {statusPayment.paymentStatus}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center pt-2 border-t border-outline-variant/20 text-sm">
+                  <span className="text-outline font-semibold">Total Amount:</span>
+                  <span className="text-on-surface font-bold">
+                    ₹{statusPayment.totalAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+              </div>
+
+              {/* Status Select Options */}
+              <div className="space-y-2.5">
+                <label className="block text-on-surface font-bold text-xs">
+                  Select New Payment Status:
+                </label>
+
+                {/* OPTION 1: PENDING */}
+                <div
+                  onClick={() => setTargetStatus("PENDING")}
+                  className={`p-3 rounded-xl border cursor-pointer transition-all ${
+                    targetStatus === "PENDING"
+                      ? "bg-amber-500/15 border-amber-500/70 shadow-[0_0_18px_rgba(245,158,11,0.2)]"
+                      : "bg-surface-container/40 border-outline-variant/20 hover:border-outline-variant/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse" />
+                      <span className="font-bold text-amber-300 text-xs">PENDING (Revert to Unpaid Dues)</span>
+                    </div>
+                    {targetStatus === "PENDING" && (
+                      <span className="material-symbols-outlined text-amber-400 text-[18px]">check_circle</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-on-surface-variant mt-1 leading-relaxed">
+                    Resets amount paid to ₹0.0 and restores ₹{statusPayment.totalAmount.toLocaleString("en-IN")} pending dues. The tenant can immediately pay again via Razorpay on their portal!
+                  </p>
+                </div>
+
+                {/* OPTION 2: FAILED */}
+                <div
+                  onClick={() => setTargetStatus("FAILED")}
+                  className={`p-3 rounded-xl border cursor-pointer transition-all ${
+                    targetStatus === "FAILED"
+                      ? "bg-error/15 border-error/70 shadow-[0_0_18px_rgba(239,68,68,0.2)]"
+                      : "bg-surface-container/40 border-outline-variant/20 hover:border-outline-variant/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="material-symbols-outlined text-error text-[16px]">cancel</span>
+                      <span className="font-bold text-error text-xs">FAILED (Transaction Failed)</span>
+                    </div>
+                    {targetStatus === "FAILED" && (
+                      <span className="material-symbols-outlined text-error text-[18px]">check_circle</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-on-surface-variant mt-1 leading-relaxed">
+                    Marks payment attempt as failed. Outstanding dues remain active for the tenant to retry repayment.
+                  </p>
+                </div>
+
+                {/* OPTION 3: PAID */}
+                <div
+                  onClick={() => setTargetStatus("PAID")}
+                  className={`p-3 rounded-xl border cursor-pointer transition-all ${
+                    targetStatus === "PAID"
+                      ? "bg-tertiary/15 border-tertiary/70 shadow-[0_0_18px_rgba(16,185,129,0.2)]"
+                      : "bg-surface-container/40 border-outline-variant/20 hover:border-outline-variant/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-tertiary" />
+                      <span className="font-bold text-tertiary text-xs">PAID (Mark Settled / Cleared)</span>
+                    </div>
+                    {targetStatus === "PAID" && (
+                      <span className="material-symbols-outlined text-tertiary text-[18px]">check_circle</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-on-surface-variant mt-1 leading-relaxed">
+                    Marks the invoice cleared and settled in full (₹{statusPayment.totalAmount.toLocaleString("en-IN")}).
+                  </p>
+                </div>
+              </div>
+
+              {/* Reason / Admin Remark */}
+              <div>
+                <label className="block text-outline text-[11px] mb-1">
+                  Audit Reason / Note <span className="text-outline-variant">(Optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={statusReason}
+                  onChange={(e) => setStatusReason(e.target.value)}
+                  placeholder="e.g. Bank chargeback, payment bounced, user requested repayment option"
+                  className="w-full px-3 py-2 bg-surface-container-lowest border border-outline-variant/40 rounded-lg text-on-surface text-xs focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-outline-variant/30">
+                <button
+                  type="button"
+                  onClick={() => setStatusPayment(null)}
+                  className="px-3.5 py-1.5 rounded-lg bg-surface-container hover:bg-surface-container-high text-on-surface-variant cursor-pointer transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isUpdatingStatus}
+                  onClick={handleUpdateStatus}
+                  className={`px-4 py-1.5 rounded-lg font-bold text-white cursor-pointer transition-all flex items-center gap-2 ${
+                    targetStatus === "PENDING"
+                      ? "bg-amber-600 hover:bg-amber-500 shadow-amber-600/30"
+                      : targetStatus === "FAILED"
+                      ? "bg-error hover:bg-red-700 shadow-error/30"
+                      : "bg-tertiary hover:bg-emerald-600 shadow-tertiary/30"
+                  } shadow-lg disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {isUpdatingStatus ? (
+                    <>
+                      <div className="w-3.5 h-3.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                      <span>Updating...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined text-[16px]">check</span>
+                      <span>Apply {targetStatus} Status</span>
+                    </>
+                  )}
                 </button>
               </div>
             </motion.div>

@@ -31,7 +31,7 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
     @Query("SELECT p FROM Payment p WHERE p.paymentStatus = :status ORDER BY COALESCE(p.paymentDate, p.updatedAt, p.createdAt) DESC")
     List<Payment> findByStatusOrderByLatestActivityDesc(@Param("status") String status);
 
-    @Query("SELECT p FROM Payment p WHERE p.paymentStatus IN ('PENDING', 'PARTIAL') ORDER BY p.createdAt DESC")
+    @Query("SELECT p FROM Payment p WHERE p.paymentStatus IN ('PENDING', 'PARTIAL', 'FAILED') ORDER BY p.createdAt DESC")
     List<Payment> findPendingPayments();
 
     @Query("SELECT COALESCE(SUM(p.rentAmount), 0.0) FROM Payment p WHERE p.billingMonth = :month")
@@ -43,6 +43,6 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
     @Query("SELECT COALESCE(SUM(p.amountPaid), 0.0) FROM Payment p WHERE p.paymentStatus = 'PAID'")
     Double calculateTotalRealizedRevenue();
 
-    @Query("SELECT COALESCE(SUM(p.pendingAmount), 0.0) FROM Payment p WHERE p.paymentStatus IN ('PENDING', 'PARTIAL')")
+    @Query("SELECT COALESCE(SUM(p.pendingAmount), 0.0) FROM Payment p WHERE p.paymentStatus IN ('PENDING', 'PARTIAL', 'FAILED')")
     Double calculateTotalPendingDues();
 }
