@@ -1,0 +1,79 @@
+services:
+  # ==========================================
+  # 1. PostgreSQL Database Service
+  # ==========================================
+  postgres-db:
+    image: postgres:16-alpine
+    container_name: rent_management_db
+    restart: always
+    environment:
+      POSTGRES_DB: rent_management_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: root
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rent_management_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rent_network
+
+  # ==========================================
+  # 2. Spring Boot Backend Service
+  # ==========================================
+  backend:
+    build:
+      context: ./rent-management-backend
+      dockerfile: Dockerfile
+    image: ${DOCKER_USERNAME:-agroxgamerzz}/rent-app-backend:latest
+    container_name: rent_management_backend
+    restart: always
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-db:5432/rent_management_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_MAIL_USERNAME: krishnasingh9697@gmail.com
+      SPRING_MAIL_PASSWORD: rrzxnoxkjdqnfotn
+      FILE_UPLOAD_DIR: uploads
+    volumes:
+      - backend_uploads:/app/uploads
+    networks:
+      - rent_network
+
+  # ==========================================
+  # 3. Next.js Frontend Service
+  # ==========================================
+  frontend:
+    build:
+      context: ./rent-management-frontend
+      dockerfile: Dockerfile
+    image: ${DOCKER_USERNAME:-agroxgamerzz}/rent-app-frontend:latest
+    container_name: rent_management_frontend
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    networks:
+      - rent_network
+
+volumes:
+  postgres_data:
+  backend_uploads:
+
+networks:
+  rent_network:
+    driver: bridge
